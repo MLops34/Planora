@@ -1,4 +1,4 @@
-# 24/7 Personalized Teaching Assistant
+# Planora - 24/7 Personalized Teaching Assistant
 
 An AI-powered study scheduler that turns PDF syllabi into smart, personalized study plans using **Spaced Repetition**, **RAG**, and **optimization**. It respects your deep work windows and syncs directly to Google Calendar.
 
