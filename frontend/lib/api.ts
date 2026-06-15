@@ -61,10 +61,17 @@ export type ChatAdjustUpdate = {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 
-export async function parseSyllabus(file: File, useLlm: boolean) {
+export async function parseSyllabus(
+  file: File,
+  useLlm: boolean,
+  focusQuery?: string | null,
+) {
   const form = new FormData();
   form.append("file", file);
   form.append("use_llm", String(useLlm));
+  if (focusQuery && focusQuery.trim()) {
+    form.append("focus_query", focusQuery.trim());
+  }
   const res = await fetch(`${API_BASE}/api/parse`, {
     method: "POST",
     body: form,
@@ -72,6 +79,33 @@ export async function parseSyllabus(file: File, useLlm: boolean) {
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.detail || "Failed to parse syllabus");
+  }
+  return (await res.json()) as {
+    syllabus: ParsedSyllabus;
+    parse_quality: ParseQuality;
+  };
+}
+
+export async function ragExtractSchedule(files: File[], extractionMetric: string) {
+  const metric = extractionMetric.trim();
+  if (!metric) {
+    throw new Error("Enter a RAG question to guide extraction.");
+  }
+  if (!files.length) {
+    throw new Error("Select at least one PDF.");
+  }
+  const form = new FormData();
+  for (const f of files) {
+    form.append("files", f);
+  }
+  form.append("extraction_metric", metric);
+  const res = await fetch(`${API_BASE}/api/rag-extract`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || "RAG extraction failed");
   }
   return (await res.json()) as {
     syllabus: ParsedSyllabus;
@@ -87,6 +121,10 @@ export async function generateSchedule(input: {
   strict_mode: boolean;
   query?: string;
   no_study_weekdays: number[];
+  max_minutes_per_day?: number;
+  min_block_minutes?: number;
+  max_block_minutes?: number;
+  planning_horizon_days?: number;
 }) {
   const res = await fetch(`${API_BASE}/api/schedule`, {
     method: "POST",

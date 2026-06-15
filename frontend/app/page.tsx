@@ -6,6 +6,7 @@ import {
   ChatMessage,
   generateSchedule,
   parseSyllabus,
+  ragExtractSchedule,
   ParsedSyllabus,
   ParseQuality,
   ScheduleAnalysis,
@@ -23,6 +24,28 @@ const weekdayMap: Record<string, number> = {
   Sunday: 6,
 };
 
+const WEEKDAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function formatScheduleDay(isoDate: string) {
+  const d = new Date(`${isoDate}T12:00:00`);
+  const wd = WEEKDAY_SHORT[d.getDay()];
+  const label = d.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  return { wd, label };
+}
+
+function topicHsl(title: string): string {
+  let h = 0;
+  for (let i = 0; i < title.length; i++) {
+    h = title.charCodeAt(i) + ((h << 5) - h);
+  }
+  const hue = 168 + (Math.abs(h) % 48);
+  return `${hue} 36% 48%`;
+}
+
 function toTopicRows(syllabus: ParsedSyllabus): Topic[] {
   return syllabus.topics.map((topic) => ({
     title: topic.title,
@@ -35,13 +58,17 @@ function toTopicRows(syllabus: ParsedSyllabus): Topic[] {
 }
 
 export default function HomePage() {
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [query, setQuery] = useState("");
   const [useLlm, setUseLlm] = useState(true);
   const [optimizerMode, setOptimizerMode] = useState<"cp_sat" | "greedy">("cp_sat");
   const [includeReviews, setIncludeReviews] = useState(true);
   const [strictMode, setStrictMode] = useState(true);
   const [noStudy, setNoStudy] = useState<string[]>([]);
+  const [maxMinutesPerDay, setMaxMinutesPerDay] = useState(240);
+  const [minBlockMinutes, setMinBlockMinutes] = useState(30);
+  const [maxBlockMinutes, setMaxBlockMinutes] = useState(90);
+  const [planningHorizonDays, setPlanningHorizonDays] = useState(56);
   const [syllabus, setSyllabus] = useState<ParsedSyllabus | null>(null);
   const [parseQuality, setParseQuality] = useState<ParseQuality | null>(null);
   const [topics, setTopics] = useState<Topic[]>([]);
@@ -49,13 +76,14 @@ export default function HomePage() {
   const [analysis, setAnalysis] = useState<ScheduleAnalysis[]>([]);
   const [ragAnswer, setRagAnswer] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingKind, setLoadingKind] = useState<"parse" | "rag" | null>(null);
   const [chatLoading, setChatLoading] = useState(false);
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     {
       role: "assistant",
       content:
-        "Ask changes like: increase priority of Unit 3, set 240 minutes for DBMS, set OS deadline to 2026-06-01.",
+        "Ask changes like: Priority, Deadlines and Duration.",
     },
   ]);
   const [error, setError] = useState<string | null>(null);
@@ -66,15 +94,38 @@ export default function HomePage() {
       if (!grouped[block.date]) grouped[block.date] = [];
       grouped[block.date].push(block);
     }
+    for (const key of Object.keys(grouped)) {
+      grouped[key].sort((a, b) => a.start_time.localeCompare(b.start_time));
+    }
     return Object.entries(grouped).sort((a, b) => a[0].localeCompare(b[0]));
   }, [blocks]);
 
+  const scheduleKpis = useMemo(() => {
+    let study = 0;
+    let review = 0;
+    for (const b of blocks) {
+      if (b.type === "review") review += b.duration_minutes;
+      else study += b.duration_minutes;
+    }
+    const days = new Set(blocks.map((b) => b.date)).size;
+    return {
+      blocks: blocks.length,
+      study,
+      review,
+      days,
+      total: study + review,
+    };
+  }, [blocks]);
+
+  const primaryFile = files[0] ?? null;
+
   async function onParse() {
-    if (!file) return;
+    if (!primaryFile) return;
     setLoading(true);
+    setLoadingKind("parse");
     setError(null);
     try {
-      const res = await parseSyllabus(file, useLlm);
+      const res = await parseSyllabus(primaryFile, useLlm, query.trim() || null);
       setSyllabus(res.syllabus);
       setParseQuality(res.parse_quality);
       setTopics(toTopicRows(res.syllabus));
@@ -85,6 +136,28 @@ export default function HomePage() {
       setError(err instanceof Error ? err.message : "Parse failed");
     } finally {
       setLoading(false);
+      setLoadingKind(null);
+    }
+  }
+
+  async function onRagExtract() {
+    if (!files.length || !query.trim()) return;
+    setLoading(true);
+    setLoadingKind("rag");
+    setError(null);
+    try {
+      const res = await ragExtractSchedule(files, query.trim());
+      setSyllabus(res.syllabus);
+      setParseQuality(res.parse_quality);
+      setTopics(toTopicRows(res.syllabus));
+      setBlocks([]);
+      setAnalysis([]);
+      setRagAnswer(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "RAG extraction failed");
+    } finally {
+      setLoading(false);
+      setLoadingKind(null);
     }
   }
 
@@ -98,6 +171,10 @@ export default function HomePage() {
       strict_mode: strictMode,
       query: query.trim() || undefined,
       no_study_weekdays: noStudy.map((d) => weekdayMap[d]),
+      max_minutes_per_day: maxMinutesPerDay,
+      min_block_minutes: minBlockMinutes,
+      max_block_minutes: maxBlockMinutes,
+      planning_horizon_days: planningHorizonDays,
     });
     setBlocks(res.blocks);
     setAnalysis(res.analysis);
@@ -164,27 +241,45 @@ export default function HomePage() {
   }
 
   return (
-    <main className="container">
-      <h1>24/7 Personalized Teaching Assistant</h1>
-      <p className="subtitle">
-        Next.js dashboard for syllabus parsing, priority tuning, and schedule generation.
-      </p>
+    <div className="app-shell">
+      <header className="app-header">
+        <div className="app-header-inner">
+          <p className="app-brand">Study intelligence</p>
+          <h1>Personalized teaching assistant</h1>
+          <p className="subtitle">
+            Parse your syllabus, tune priorities, and generate an optimized plan with live chat
+            adjustments.
+          </p>
+        </div>
+      </header>
 
-      <div className="layout">
-        <div className="planner-pane">
+      <main className="container">
+        <div className="layout">
+          <div className="planner-pane">
       <section className="card">
         <h2>Upload and Parse</h2>
         <div className="grid">
           <div>
-            <label>Upload syllabus PDF</label>
+            <label>Upload syllabus PDF (multiple for guided RAG)</label>
             <input
               type="file"
               accept=".pdf"
-              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+              multiple
+              onChange={(e) =>
+                setFiles(e.target.files?.length ? Array.from(e.target.files) : [])
+              }
             />
+            {files.length > 1 && (
+              <p className="card-kicker" style={{ marginTop: "0.5rem" }}>
+                Parse uses the first file only. Use &quot;Extract with RAG&quot; to combine all
+                PDFs using your question below.
+              </p>
+            )}
           </div>
           <div>
-            <label>Optional RAG question</label>
+            <label title="Parse (LLM): steers the model toward matching sections. Schedule: RAG answer over the syllabus. Guided RAG extract: retrieval query for multi-PDF extraction (e.g. list required subjects).">
+              Retrieval Question(guides parsing)
+            </label>
             <input value={query} onChange={(e) => setQuery(e.target.value)} />
           </div>
         </div>
@@ -197,8 +292,16 @@ export default function HomePage() {
             />
             Use LLM parsing
           </label>
-          <button disabled={!file || loading} onClick={onParse}>
-            {loading ? "Parsing..." : "Parse Syllabus"}
+          <button disabled={!primaryFile || loading} onClick={onParse}>
+            {loading && loadingKind === "parse" ? "Parsing..." : "Parse Syllabus"}
+          </button>
+          <button
+            type="button"
+            disabled={!files.length || !query.trim() || loading}
+            onClick={onRagExtract}
+            title="Requires a non-empty question. Best for multiple PDFs or table-heavy syllabi."
+          >
+            {loading && loadingKind === "rag" ? "Extracting..." : "Extract"}
           </button>
         </div>
       </section>
@@ -272,6 +375,56 @@ export default function HomePage() {
                 {day}
               </label>
             ))}
+          </div>
+
+          <p className="card-kicker" style={{ marginTop: "1rem" }}>
+            Daily limits and planning window (sent to the optimizer).
+          </p>
+          <div className="limits-row">
+            <label>
+              Max minutes / day
+              <input
+                type="number"
+                min={60}
+                max={720}
+                step={15}
+                value={maxMinutesPerDay}
+                onChange={(e) => setMaxMinutesPerDay(Number(e.target.value))}
+              />
+            </label>
+            <label>
+              Min block (min)
+              <input
+                type="number"
+                min={15}
+                max={120}
+                step={5}
+                value={minBlockMinutes}
+                onChange={(e) => setMinBlockMinutes(Number(e.target.value))}
+              />
+            </label>
+            <label>
+              Max block (min)
+              <input
+                type="number"
+                min={30}
+                max={240}
+                step={5}
+                value={maxBlockMinutes}
+                onChange={(e) => setMaxBlockMinutes(Number(e.target.value))}
+              />
+            </label>
+            <label>
+              Horizon (days)
+              <input
+                type="number"
+                min={7}
+                max={180}
+                step={1}
+                value={planningHorizonDays}
+                onChange={(e) => setPlanningHorizonDays(Number(e.target.value))}
+              />
+            </label>
           </div>
 
           <div className="table-wrap">
@@ -351,58 +504,129 @@ export default function HomePage() {
 
       {!!ragAnswer && (
         <section className="card">
-          <h2>RAG Answer</h2>
-          <p>{ragAnswer}</p>
+          <h2>RAG answer</h2>
+          <p className="rag-answer">{ragAnswer}</p>
         </section>
       )}
 
       {blocks.length > 0 && (
-        <section className="card">
-          <h2>Daily Agenda</h2>
-          {agenda.map(([day, dayBlocks]) => (
-            <details key={day}>
-              <summary>
-                {day} - {dayBlocks.reduce((acc, b) => acc + b.duration_minutes, 0)} minutes
-              </summary>
-              <ul>
-                {dayBlocks.map((block, i) => (
-                  <li key={`${day}-${i}`}>
-                    {block.start_time.slice(0, 5)} ({block.duration_minutes}m) [{block.type}]{" "}
-                    {block.topic}
-                  </li>
-                ))}
-              </ul>
-            </details>
-          ))}
+        <section className="card schedule-card">
+          <h2>Study schedule</h2>
+          <p className="card-kicker">
+            Color-coded by topic; reviews use a warm accent. Bar width shows share of that day.
+          </p>
+
+          <div className="schedule-kpis">
+            <div className="schedule-kpi">
+              <span>Scheduled days</span>
+              <strong>{scheduleKpis.days}</strong>
+            </div>
+            <div className="schedule-kpi">
+              <span>Total blocks</span>
+              <strong>{scheduleKpis.blocks}</strong>
+            </div>
+            <div className="schedule-kpi">
+              <span>Study minutes</span>
+              <strong>{scheduleKpis.study}</strong>
+            </div>
+            <div className="schedule-kpi review">
+              <span>Review minutes</span>
+              <strong>{scheduleKpis.review}</strong>
+            </div>
+          </div>
+
+          <div className="schedule-days">
+            {agenda.map(([day, dayBlocks]) => {
+              const dayTotal = dayBlocks.reduce((acc, b) => acc + b.duration_minutes, 0);
+              const { wd, label } = formatScheduleDay(day);
+              return (
+                <article key={day} className="schedule-day">
+                  <header>
+                    <span className="schedule-day-wd">{wd}</span>
+                    <span className="schedule-day-date">{label}</span>
+                    <span className="schedule-day-total">{dayTotal} min planned</span>
+                  </header>
+                  <div className="schedule-blocks">
+                    {dayBlocks.map((block, i) => {
+                      const pct = dayTotal > 0 ? (block.duration_minutes / dayTotal) * 100 : 0;
+                      const typeClass = block.type === "review" ? "review" : "study";
+                      const rail =
+                        block.type === "review"
+                          ? undefined
+                          : { background: `hsl(${topicHsl(block.topic)})` };
+                      return (
+                        <div
+                          key={`${day}-${i}`}
+                          className={`schedule-block type-${typeClass}`}
+                        >
+                          <div className="schedule-block-rail" style={rail} />
+                          <div className="schedule-block-time">
+                            {block.start_time.slice(0, 5)}
+                          </div>
+                          <div className="schedule-block-body">
+                            <div className="schedule-block-top">
+                              <span className="schedule-topic" title={block.topic}>
+                                {block.topic}
+                              </span>
+                              <span className="schedule-chip">{block.type}</span>
+                              <span className="schedule-duration">{block.duration_minutes} min</span>
+                            </div>
+                            <div className="schedule-bar-track">
+                              <div
+                                className="schedule-bar-fill"
+                                style={{ width: `${Math.max(pct, 3)}%` }}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
         </section>
       )}
 
       {analysis.length > 0 && (
         <section className="card">
-          <h2>Priority Analysis</h2>
+          <h2>Coverage analysis</h2>
+          <p className="card-kicker">Target vs planned minutes and deadline risk.</p>
           <div className="table-wrap">
-            <table>
+            <table className="analysis-table">
               <thead>
                 <tr>
                   <th>Topic</th>
                   <th>Target</th>
                   <th>Planned</th>
-                  <th>Coverage %</th>
-                  <th>Strict Score</th>
-                  <th>Overdue Minutes</th>
+                  <th>Coverage</th>
+                  <th>Score</th>
+                  <th>Overdue</th>
                 </tr>
               </thead>
               <tbody>
-                {analysis.map((row) => (
-                  <tr key={row.topic}>
-                    <td>{row.topic}</td>
-                    <td>{row.target_minutes}</td>
-                    <td>{row.planned_minutes}</td>
-                    <td>{row.coverage_pct ?? "-"}</td>
-                    <td>{row.strict_score}</td>
-                    <td>{row.overdue_minutes}</td>
-                  </tr>
-                ))}
+                {analysis.map((row) => {
+                  const cov = row.coverage_pct;
+                  let covClass = "cov-warn";
+                  if (cov == null) covClass = "";
+                  else if (cov >= 90) covClass = "cov-ok";
+                  else if (cov < 60) covClass = "cov-bad";
+                  const odClass =
+                    row.overdue_minutes > 0 ? "overdue-bad" : "overdue-zero";
+                  return (
+                    <tr key={row.topic}>
+                      <td>{row.topic}</td>
+                      <td>{row.target_minutes}</td>
+                      <td>{row.planned_minutes}</td>
+                      <td className={covClass}>
+                        {cov != null ? `${cov}%` : "—"}
+                      </td>
+                      <td>{row.strict_score}</td>
+                      <td className={odClass}>{row.overdue_minutes}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -443,6 +667,7 @@ export default function HomePage() {
       </div>
 
       {error && <p className="error">{error}</p>}
-    </main>
+      </main>
+    </div>
   );
 }

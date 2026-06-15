@@ -18,8 +18,8 @@ from dotenv import load_dotenv
 from core.calendar_sync import CalendarSyncConfig, CalendarSyncError, sync_study_blocks_to_calendar
 from core.llm_provider import get_llm_provider_config
 from core.optimizer import DailyLimits, DeepWorkWindow, StudyBlock, StudyScheduler
-from core.parser import parse_syllabus_pdf
-from core.rag import SyllabusRAG
+from core.parser import parse_syllabus_pdf, _parse_retrieval_intent, extract_subjects
+from core.rag import rag_qa_over_raw_text
 from models.syllabus import ParsedSyllabus, Topic
 
 logger = logging.getLogger(__name__)
@@ -52,10 +52,10 @@ def parse_window(window_text: str) -> DeepWorkWindow:
         ) from exc
 
 
-def parse_syllabus(path: str, use_llm: bool) -> ParsedSyllabus:
+def parse_syllabus(path: str, use_llm: bool, focus_query: Optional[str] = None) -> ParsedSyllabus:
     if not Path(path).exists():
         raise FileNotFoundError(f"Syllabus PDF does not exist: {path}")
-    return parse_syllabus_pdf(path, use_llm=use_llm)
+    return parse_syllabus_pdf(path, use_llm=use_llm, focus_query=focus_query)
 
 
 def ensure_llm_api_key(required: bool, context: str) -> None:
@@ -66,18 +66,18 @@ def ensure_llm_api_key(required: bool, context: str) -> None:
         cfg = get_llm_provider_config()
     except ValueError as exc:
         raise ValueError(
-            f"{context} requires API credentials. Set OPENAI_API_KEY (OpenAI) "
+            f"{context} requires API credentials. Set GROQ_API_KEY (Groq), OPENAI_API_KEY (OpenAI), "
             f"or OPENROUTER_API_KEY (OpenRouter). Details: {exc}"
         ) from exc
     logger.info("Using LLM provider: %s", cfg.provider)
 
 
 def optional_rag_query(syllabus: ParsedSyllabus, question: Optional[str]) -> Optional[str]:
-    if not question:
+    if not question or not question.strip():
         return None
-    rag = SyllabusRAG()
-    rag.ingest_text(syllabus.raw_text or "")
-    return rag.query(question)
+    if not (syllabus.raw_text or "").strip():
+        return None
+    return rag_qa_over_raw_text(syllabus.raw_text or "", question.strip())
 
 
 def _fallback_topics_from_raw_text(raw_text: str, max_topics: int = 8) -> list[Topic]:
@@ -360,6 +360,105 @@ def _render_priority_editor(syllabus: ParsedSyllabus) -> tuple[dict[str, int], d
     return topic_minutes_override, topic_difficulty, topic_deadlines
 
 
+def _render_retrieval_results(syllabus: ParsedSyllabus) -> None:
+    """
+    Render structured subject extraction results based on the retrieval intent
+    stored in ``st.session_state`` after parsing.
+
+    Behaviour
+    ---------
+    * **Semester / course-code / all filter** → runs ``extract_subjects()`` on
+      ``syllabus.raw_text`` and shows a tidy dataframe.
+    * **No structured match** from raw text → falls back to the LLM-extracted
+      ``syllabus.topics`` list with a notice.
+    * **No retrieval query** → silent, nothing rendered.
+    """
+    import streamlit as st
+
+    intent = st.session_state.get("retrieval_intent")
+    raw_query = st.session_state.get("retrieval_query", "")
+
+    if not raw_query:
+        return  # User didn't type a retrieval question — nothing to show
+
+    st.divider()
+    st.subheader("🔍 Retrieval Results")
+
+    if intent is None:
+        # Query typed but not a structured retrieval → will be handled as RAG
+        st.info(
+            f'"{raw_query}" doesn\'t look like a subject filter. '
+            "It will be answered as a RAG question when you click **Generate Schedule**."
+        )
+        return
+
+    # ── Run extract_subjects() based on intent ────────────────────────────────
+    raw_text = syllabus.raw_text or ""
+    subjects: list = []
+
+    intent_type = intent.get("type")
+    intent_value = intent.get("value")
+
+    if intent_type == "semester":
+        subjects = extract_subjects(raw_text, semester=intent_value)
+        filter_label = f"Semester {intent_value}"
+    elif intent_type == "course_code":
+        subjects = extract_subjects(raw_text, course_code=intent_value)
+        filter_label = f"Course code: {intent_value}"
+    else:  # "all"
+        subjects = extract_subjects(raw_text)
+        filter_label = "All semesters"
+
+    # ── Display results ───────────────────────────────────────────────────────
+    if subjects:
+        st.success(
+            f"Found **{len(subjects)} subject(s)** matching: *{filter_label}*"
+        )
+        rows = [
+            {
+                "Semester": s.semester if s.semester else "—",
+                "Course Code": s.course_code,
+                "Subject": s.subject,
+                "Credits": s.credits,
+                "L": s.lecture,
+                "T": s.tutorial,
+                "P": s.practical,
+                "Category": s.category,
+            }
+            for s in subjects
+        ]
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    else:
+        # ── Fallback: structured rows not found in raw text ───────────────────
+        # This happens with unstructured/essay-style syllabi where there is no
+        # course-code + L/T/P table. Show LLM-extracted topics instead.
+        st.warning(
+            f"No structured subject rows were found for *{filter_label}* in the raw PDF text. "
+            "This usually means the syllabus doesn't use a standard course-code table format."
+        )
+        if syllabus.topics:
+            st.caption(
+                "Showing LLM-extracted topic list as a fallback \u2014 "
+                "these are content topics, not subject rows."
+            )
+            topic_rows = [
+                {
+                    "Topic": t.title,
+                    "Description": t.description or "—",
+                    "Weight (%)": t.weightage_percent if t.weightage_percent else "—",
+                    "Est. Hours": t.estimated_hours if t.estimated_hours else "—",
+                }
+                for t in syllabus.topics
+            ]
+            st.dataframe(topic_rows, use_container_width=True, hide_index=True)
+        else:
+            st.error(
+                "No topics or subjects could be extracted from this PDF. "
+                "Try enabling LLM parsing or uploading a clearer syllabus file."
+            )
+
+
 def _render_schedule_results(blocks: list[StudyBlock], analysis_rows: list[dict[str, object]]) -> None:
     import streamlit as st
 
@@ -427,7 +526,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     ensure_llm_api_key(args.use_llm, "LLM syllabus parsing")
     ensure_llm_api_key(bool(args.query), "RAG querying")
 
-    syllabus = parse_syllabus(args.pdf, use_llm=args.use_llm)
+    syllabus = parse_syllabus(args.pdf, use_llm=args.use_llm, focus_query=args.focus_query)
     syllabus = ensure_topics_for_scheduling(syllabus)
     logger.info("Parsed syllabus with %s topics and %s exam dates.", len(syllabus.topics), len(syllabus.exam_dates))
 
@@ -436,7 +535,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         print("\nRAG Answer:")
         print(answer)
 
-    default_windows = ["mon 19:00-21:00", "wed 19:00-21:00", "sat 10:00-12:00"]
+    default_windows = ["mon 18:30-21:30", "wed 18:30-21:30", "thu 18:30-21:00", "sat 09:30-12:30", "sun 10:00-12:30"]
     window_inputs = args.window if args.window else default_windows
     windows = [parse_window(w) for w in window_inputs]
     limits = DailyLimits(
@@ -475,6 +574,11 @@ def build_cli() -> argparse.ArgumentParser:
     parser.add_argument("--pdf", default=None, help="Path to syllabus PDF file.")
     parser.add_argument("--use-llm", action="store_true", help="Enable LLM parsing.")
     parser.add_argument("--query", default=None, help="Optional RAG question.")
+    parser.add_argument(
+        "--focus-query",
+        default=None,
+        help="Optional question to steer LLM parsing toward relevant PDF sections.",
+    )
     parser.add_argument(
         "--window",
         action="append",
@@ -516,7 +620,20 @@ def run_streamlit_demo() -> None:
     col_upload, col_options = st.columns([1.3, 1.1])
     with col_upload:
         uploaded = st.file_uploader("Upload syllabus PDF", type=["pdf"])
-        query = st.text_input("Optional RAG question")
+        focus_query = st.text_input(
+            "📌 Parse focus (optional)",
+            help="Steers LLM extraction toward relevant sections of the PDF. "
+            "E.g. 'data structures topics' or 'exam schedule'.",
+        )
+        retrieval_query = st.text_input(
+            "🔍 Retrieval question (optional)",
+            help="Ask for specific subjects from the syllabus. Examples:\n"
+            "• 'extract semester 2 subjects'\n"
+            "• 'show me CSEB204'\n"
+            "• 'list all subjects'\n\n"
+            "For general questions (e.g. 'what is ML?'), the answer is shown as a RAG response.",
+            placeholder="e.g. semester 2 subjects, CSEB204, list all courses",
+        )
     with col_options:
         use_llm = st.checkbox("Use LLM parsing", value=True)
         optimizer_mode = st.selectbox("Optimizer Mode", options=["cp_sat", "greedy"], index=0)
@@ -526,6 +643,8 @@ def run_streamlit_demo() -> None:
             value=True,
             help="Prioritizes allocation using priority, remaining duration, and deadline urgency.",
         )
+    # Keep a single combined query for backward-compat with RAG + focus_query paths
+    query = retrieval_query or focus_query
     weekday_to_idx = {
         "Monday": 0,
         "Tuesday": 1,
@@ -555,7 +674,11 @@ def run_streamlit_demo() -> None:
         temp_path.write_bytes(uploaded.getvalue())
         try:
             ensure_llm_api_key(use_llm, "LLM syllabus parsing")
-            parsed = parse_syllabus_pdf(str(temp_path), use_llm=use_llm)
+            parsed = parse_syllabus_pdf(
+                str(temp_path),
+                use_llm=use_llm,
+                focus_query=focus_query.strip() or None,
+            )
             parsed = ensure_topics_for_scheduling(parsed)
             if not parsed.topics:
                 st.error(
@@ -567,6 +690,15 @@ def run_streamlit_demo() -> None:
             st.success(f"Syllabus parsed successfully. Topics detected: {len(parsed.topics)}")
             quality = _compute_parse_quality(parsed.raw_text or "", len(parsed.topics))
             st.session_state["parse_quality"] = quality
+
+            # ── Retrieval intent resolution ──────────────────────────────────
+            if retrieval_query.strip():
+                intent = _parse_retrieval_intent(retrieval_query.strip())
+                st.session_state["retrieval_intent"] = intent
+                st.session_state["retrieval_query"] = retrieval_query.strip()
+            else:
+                st.session_state.pop("retrieval_intent", None)
+                st.session_state.pop("retrieval_query", None)
         except Exception as exc:  # noqa: BLE001
             st.error(str(exc))
             return
@@ -605,20 +737,32 @@ def run_streamlit_demo() -> None:
 
     topic_minutes_override, topic_difficulty, topic_deadlines = _render_priority_editor(syllabus)
 
+    # ── Retrieval results ────────────────────────────────────────────────────
+    _render_retrieval_results(syllabus)
+
     if not st.button("Generate Schedule", type="primary"):
         return
 
     try:
-        ensure_llm_api_key(bool(query), "RAG querying")
-        if query:
-            ans = optional_rag_query(syllabus, query)
-            st.subheader("RAG Answer")
-            st.write(ans)
+        ensure_llm_api_key(bool(retrieval_query or focus_query), "RAG querying")
+        if retrieval_query and not st.session_state.get("retrieval_intent"):
+            # Not a retrieval query — treat as a RAG question
+            ans = optional_rag_query(syllabus, retrieval_query)
+            if ans:
+                st.subheader("💬 Extracted Answer")
+                st.write(ans)
+        elif focus_query and not retrieval_query:
+            ans = optional_rag_query(syllabus, focus_query)
+            if ans:
+                st.subheader("💬 Extracted Answer")
+                st.write(ans)
 
         windows = [
-            DeepWorkWindow(weekday=0, start_time=time(19, 0), end_time=time(21, 0)),
-            DeepWorkWindow(weekday=2, start_time=time(19, 0), end_time=time(21, 0)),
-            DeepWorkWindow(weekday=5, start_time=time(10, 0), end_time=time(12, 0)),
+            DeepWorkWindow(weekday=0, start_time=time(18, 30), end_time=time(21, 30)),
+            DeepWorkWindow(weekday=2, start_time=time(18, 30), end_time=time(21, 30)),
+            DeepWorkWindow(weekday=3, start_time=time(18, 30), end_time=time(21, 0)),
+            DeepWorkWindow(weekday=5, start_time=time(9, 30), end_time=time(12, 30)),
+            DeepWorkWindow(weekday=6, start_time=time(10, 0), end_time=time(12, 30)),
         ]
         explicit_minutes_mode = any(v > 0 for v in topic_minutes_override.values())
         scheduler = StudyScheduler(preferred_mode=optimizer_mode)

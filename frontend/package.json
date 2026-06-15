@@ -18,5 +18,14 @@
     "@types/node": "22.5.4",
     "@types/react": "18.3.4",
     "@types/react-dom": "18.3.0"
-  }
+  },
+  "description": "",
+  "main": "next.config.js",
+  "directories": {
+    "lib": "lib"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
 }

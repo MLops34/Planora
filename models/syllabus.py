@@ -4,9 +4,26 @@ from __future__ import annotations
 
 from datetime import date as dt_date
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator, computed_field
+
+
+class Subject(BaseModel):
+    """A subject/course extracted from syllabus text with structured metadata."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    semester: Optional[int] = Field(default=None, description="Semester number (1-8).")
+    course_code: str = Field(min_length=1, description="Course code (e.g., CSEB204).")
+    subject: str = Field(min_length=1, description="Subject name.")
+    credits: int = Field(ge=0, description="Credit hours.")
+    lecture: int = Field(ge=0, description="Lecture hours per week.")
+    tutorial: int = Field(ge=0, description="Tutorial hours per week.")
+    practical: int = Field(ge=0, description="Practical hours per week.")
+    category: Literal["THEORY", "PRACTICAL"] = Field(
+        default="THEORY", description="Course category."
+    )
 
 
 class Topic(BaseModel):
@@ -86,6 +103,20 @@ class ParsedSyllabus(BaseModel):
     source_path: Optional[str] = Field(
         default=None,
         description="Absolute or relative path to the source file.",
+    )
+    extraction_confidence: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score (0-1) for extraction quality and completeness.",
+    )
+    extraction_method: Optional[str] = Field(
+        default=None,
+        description="Method used for extraction (e.g., 'pdfplumber', 'pymupdf', 'ocr').",
+    )
+    extraction_metadata: dict = Field(
+        default_factory=dict,
+        description="Additional metadata about the extraction process.",
     )
 
     @model_validator(mode="after")
